@@ -17,9 +17,17 @@ export default function HomeScreen() {
         </TouchableOpacity>
       </Link>
 
+      {/* Cantidades */}
       <Link href="/inventory/new" asChild>
         <TouchableOpacity style={styles.btn}>
-          <Text style={styles.btnText}>Nuevo inventario</Text>
+          <Text style={styles.btnText}>Nuevo inventario (cantidades)</Text>
+        </TouchableOpacity>
+      </Link>
+
+      {/* Vencimientos */}
+      <Link href={{ pathname: "/inventory/new", params: { mode: "vto" } }} asChild>
+        <TouchableOpacity style={styles.btn}>
+          <Text style={styles.btnText}>Nuevo inventario (vencimientos)</Text>
         </TouchableOpacity>
       </Link>
 

@@ -1,10 +1,12 @@
-// app/inventory/new.tsx
-import { Stack, router } from "expo-router";
-import React, { useState } from "react";
+import { Stack, router, useLocalSearchParams } from "expo-router";
+import React, { useMemo, useState } from "react";
 import { Alert, StyleSheet, Text, TextInput, TouchableOpacity, View } from "react-native";
 import { createInventory } from "../../features/inventory/inventoryService";
 
 export default function NewInventory() {
+  const { mode } = useLocalSearchParams<{ mode?: string }>();
+  const isVto = useMemo(() => mode === "vto", [mode]);
+
   const [nombre, setNombre] = useState("");
   const [descripcion, setDescripcion] = useState("");
 
@@ -15,7 +17,10 @@ export default function NewInventory() {
     }
     try {
       const id = await createInventory(nombre, descripcion);
-      router.replace({ pathname: "/inventory/active", params: { id: String(id) } });
+      router.replace({
+        pathname: isVto ? "/inventory/expiry" : "/inventory/active",
+        params: { id: String(id) },
+      });
     } catch (e: any) {
       Alert.alert("Error", e?.message ?? "No se pudo crear el inventario.");
     }
@@ -23,12 +28,12 @@ export default function NewInventory() {
 
   return (
     <View style={styles.container}>
-      <Stack.Screen options={{ title: "Nuevo inventario" }} />
+      <Stack.Screen options={{ title: isVto ? "Nuevo inventario (vencimientos)" : "Nuevo inventario" }} />
       <Text style={styles.label}>Nombre *</Text>
       <TextInput
         value={nombre}
         onChangeText={setNombre}
-        placeholder="Ej: Pre-inventario Góndola A"
+        placeholder={isVto ? "Ej: Recepción lácteos - vtos" : "Ej: Pre-inventario Góndola A"}
         style={styles.input}
       />
 
@@ -36,7 +41,7 @@ export default function NewInventory() {
       <TextInput
         value={descripcion}
         onChangeText={setDescripcion}
-        placeholder="Notas, sector, responsable..."
+        placeholder="Notas breves..."
         style={[styles.input, { height: 80 }]}
         multiline
       />

@@ -4,7 +4,7 @@ import * as FileSystem from "expo-file-system";
 import XLSX from "xlsx";
 import { getDB } from "../../db/client";
 
-// Utilidad: limpia EAN (quita apóstrofe inicial y espacios)
+// ---------- Normalizadores ----------
 const normalizeEAN = (raw: any): string => {
   if (raw === null || raw === undefined) return "";
   let s = String(raw).trim();
@@ -12,28 +12,68 @@ const normalizeEAN = (raw: any): string => {
   return s;
 };
 
-// Utilidad: convierte "7,04" -> 7.04; default 1 si vacío/0/NaN
 const normalizeUnits = (raw: any): number => {
-  if (raw === null || raw === undefined) return 1;
-  const s = String(raw).replace(",", ".").trim();
+  const s = String(raw ?? "").replace(",", ".").trim();
   const n = Number(s);
-  if (!isFinite(n) || n <= 0) return 1;
-  return n;
+  return !isFinite(n) || n <= 0 ? 1 : n;
 };
 
-// Valida encabezados mínimos
-const requiredHeaders = ["EAN", "codigo_articulo", "descripcion", "unidades_por_bulto"];
+const normalizeBool01 = (raw: any): number => (String(raw ?? "").trim() === "1" ? 1 : 0);
 
-const validateHeaders = (headers: string[]) => {
-  const lower = headers.map(h => String(h).trim().toLowerCase());
-  for (const req of requiredHeaders) {
-    if (!lower.includes(req.toLowerCase())) {
-      throw new Error(`Falta columna requerida: ${req}`);
-    }
+// Quita acentos y preserva guiones bajos
+const stripDiacritics = (str: string) =>
+  str.normalize("NFD").replace(/[\u0300-\u036f]/g, ""); // sin \p{Diacritic}
+
+const toSlug = (h: string) =>
+  stripDiacritics(String(h))
+    .toLowerCase()
+    .replace(/[\s-]+/g, "_") // espacios/guiones -> _
+    .replace(/_+/g, "_")
+    .replace(/[^a-z0-9_]/g, "") // preserva _
+    .replace(/^_+|_+$/g, "");
+
+// Mapa canónico -> variantes aceptadas
+const headerMap: Record<string, string[]> = {
+  ean: ["ean"],
+  codigo_articulo: ["codigo_articulo", "codigo", "codarticulo", "codigo_interno", "plu"],
+  descripcion: ["descripcion", "descripción", "desc"],
+  unidades_por_bulto: ["unidades_por_bulto", "unidades_por_paquete", "uxb", "unidades_paquete", "unidadesxbolsa"],
+  pesable: ["pesable"],
+  pesable_por_unidad: ["pesable_x_un", "pesable_por_unidad", "pesablexun", "pesable_x_unidad"],
+};
+
+// Construye un objeto { slug: valor } para acceder robusto a cada fila
+function slugRow(row: any) {
+  const out: Record<string, any> = {};
+  for (const k of Object.keys(row)) {
+    out[toSlug(k)] = row[k];
   }
+  return out;
+}
+
+// Devuelve el valor de la columna canónica, buscando por variantes
+function pick(row: any, canonical: keyof typeof headerMap) {
+  const srow = slugRow(row);
+  for (const variant of headerMap[canonical]) {
+    if (variant in srow) return srow[variant];
+    if (variant in row) return row[variant];
+  }
+  return undefined;
+}
+
+const requiredCanonicals = ["ean", "codigo_articulo", "descripcion", "unidades_por_bulto"] as const;
+
+const validateHeadersFlexible = (rows: any[]) => {
+  if (!rows.length) return;
+  const missing: string[] = [];
+  for (const key of requiredCanonicals) {
+    const sample = pick(rows[0], key);
+    if (sample === undefined) missing.push(key);
+  }
+  if (missing.length) throw new Error(`Faltan columnas requeridas: ${missing.join(", ")}`);
 };
 
-// Lee un archivo Excel desde URI (DocumentPicker) y devuelve arreglo de filas normalizadas
+// ---------- Parseo del Excel ----------
 const parseExcelAtUri = async (uri: string) => {
   const b64 = await FileSystem.readAsStringAsync(uri, { encoding: FileSystem.EncodingType.Base64 });
   const wb = XLSX.read(b64, { type: "base64" });
@@ -42,38 +82,50 @@ const parseExcelAtUri = async (uri: string) => {
   const rows = XLSX.utils.sheet_to_json(ws, { defval: "" }) as any[];
 
   if (!rows.length) return [];
+  validateHeadersFlexible(rows);
 
-  // Validar encabezados
-  const firstRowKeys = Object.keys(rows[0]);
-  validateHeaders(firstRowKeys);
-
-  // Normalizar filas
   const normalized = rows.map((r) => {
-    const ean = normalizeEAN(r["EAN"]);
-    const codigo = String(r["codigo_articulo"] ?? "").trim();
-    const descripcion = String(r["descripcion"] ?? "").trim();
-    const upb = normalizeUnits(r["unidades_por_bulto"]);
-    return { ean, codigo_articulo: codigo, descripcion, unidades_por_bulto: upb };
+    const ean = normalizeEAN(pick(r, "ean"));
+    const codigo = String(pick(r, "codigo_articulo") ?? "").trim();
+    const descripcion = String(pick(r, "descripcion") ?? "").trim();
+    const upb = normalizeUnits(pick(r, "unidades_por_bulto"));
+    const pesable = normalizeBool01(pick(r, "pesable"));
+    const pesable_por_unidad = normalizeBool01(pick(r, "pesable_por_unidad"));
+    return { ean, codigo_articulo: codigo, descripcion, unidades_por_bulto: upb, pesable, pesable_por_unidad };
   });
 
-  // Filtrar vacíos
+  // Filtrar filas sin EAN o sin descripción
   return normalized.filter((r) => r.ean && r.descripcion);
 };
 
-// Inserta en lotes para rendimiento
+// ---------- Inserción por lotes ----------
 const insertBatch = async (
   db: Awaited<ReturnType<typeof getDB>>,
-  batch: Array<{ ean: string; codigo_articulo: string; descripcion: string; unidades_por_bulto: number }>,
+  batch: Array<{
+    ean: string;
+    codigo_articulo: string;
+    descripcion: string;
+    unidades_por_bulto: number;
+    pesable: number;
+    pesable_por_unidad: number;
+  }>,
   ts: number
 ) => {
-  // Usamos parámetros para evitar inyección y acelerar
   const stmt = await db.prepareAsync(
-    "INSERT INTO articulos (ean, codigo_articulo, descripcion, unidades_por_bulto, ultimo_update) VALUES (?,?,?,?,?)"
+    "INSERT INTO articulos (ean, codigo_articulo, descripcion, unidades_por_bulto, pesable, pesable_por_unidad, ultimo_update) VALUES (?,?,?,?,?,?,?)"
   );
   try {
     await db.execAsync("BEGIN");
     for (const r of batch) {
-      await stmt.executeAsync([r.ean, r.codigo_articulo, r.descripcion, r.unidades_por_bulto, ts]);
+      await stmt.executeAsync([
+        r.ean,
+        r.codigo_articulo,
+        r.descripcion,
+        r.unidades_por_bulto,
+        r.pesable,
+        r.pesable_por_unidad,
+        ts,
+      ]);
     }
     await db.execAsync("COMMIT");
   } catch (e) {
@@ -84,16 +136,17 @@ const insertBatch = async (
   }
 };
 
-// Flujo principal: elegir archivo → parsear → reemplazar tabla articulos
+// ---------- Flujo principal ----------
 export const pickAndImportCatalog = async (): Promise<{ total: number }> => {
   const res = await DocumentPicker.getDocumentAsync({
     copyToCacheDirectory: true,
-    type: ["application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "application/vnd.ms-excel"],
+    type: [
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      "application/vnd.ms-excel",
+    ],
     multiple: false,
   });
-  if (res.canceled || !res.assets?.length) {
-    throw new Error("Usuario canceló la selección de archivo.");
-  }
+  if (res.canceled || !res.assets?.length) throw new Error("Usuario canceló la selección de archivo.");
 
   const uri = res.assets[0].uri;
   const rows = await parseExcelAtUri(uri);
@@ -101,7 +154,6 @@ export const pickAndImportCatalog = async (): Promise<{ total: number }> => {
   const db = await getDB();
   const ts = Date.now();
 
-  // Reemplazo total
   await db.execAsync("BEGIN");
   try {
     await db.execAsync("DELETE FROM articulos;");
@@ -111,12 +163,10 @@ export const pickAndImportCatalog = async (): Promise<{ total: number }> => {
     throw e;
   }
 
-  // Insert en lotes (ajustar tamaño según perf del dispositivo)
   const BATCH = 800;
   for (let i = 0; i < total; i += BATCH) {
     const slice = rows.slice(i, i + BATCH);
     await insertBatch(db, slice, ts);
   }
-
   return { total };
 };
